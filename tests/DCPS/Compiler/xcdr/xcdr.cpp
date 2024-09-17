@@ -2818,6 +2818,89 @@ TEST(OptionalTests, Present)
   amalgam_serializer_test(xcdr2, expected, value, result);
 }
 
+// ----------------------------------------------------------------------------
+
+template<>
+void expect_values_equal(const Optional::MutableOptionalMembers& a, const Optional::MutableOptionalMembers& b)
+{
+  EXPECT_EQ(a.bool_field(), b.bool_field());
+  EXPECT_EQ(a.short_field(), b.short_field());
+  EXPECT_EQ(a.int32_field(), b.int32_field());
+  EXPECT_EQ(a.int64_field(), b.int64_field());
+  EXPECT_EQ(a.str_field(), b.str_field());
+  EXPECT_EQ(a.seq_field(), b.seq_field());
+  ASSERT_EQ(a.struct_field().has_value(), b.struct_field().has_value());
+  if (a.struct_field().has_value()) {
+    EXPECT_EQ(a.struct_field()->octet_field(), b.struct_field()->octet_field());
+  }
+}
+
+TEST(MutableOptionalTests, NotPresent)
+{
+  const uint8_t expected[] = {
+    // Delimeter
+    0x00, 0x00, 0x00, 0x07, // +4 = 4
+
+    // bool_field
+    0x00, // +1 = 5
+
+    // short_field
+    0x00, // +1 = 6
+
+    // int32_field
+    0x00, // +1 = 7
+
+    // int64_field
+    0x00, // +1 = 8
+
+    // str_field
+    0x00, // +1 = 9
+
+    0x00,
+
+    0x00
+  };
+
+  Optional::MutableOptionalMembers empty{};
+  Optional::MutableOptionalMembers result;
+  amalgam_serializer_test(xcdr2, expected, empty, result);
+}
+
+TEST(MutableOptionalTests, Present)
+{
+  const uint8_t expected[] = {
+    // Delimeter
+    0x00, 0x00, 0x00, 0x1a, // +4 = 4
+
+    // bool_field
+    0x00,
+
+    // short_field
+    0x01, // +1 is_present = 5
+    0x7f, 0xff, // +2 = 8
+
+    // int32_field
+    0x00, // +1 is_present = 9
+    0x00,
+
+    // str_field
+    0x01, // +1 = 10
+    0x00, // ?
+    0x00, 0x00, 0x00, 0x0c, // +4 = 14
+    'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '\0', // +12 = 26
+    0x00,
+
+    // struct_field
+    0x00
+  };
+
+  Optional::MutableOptionalMembers value{};
+  value.short_field(0x7fff);
+  value.str_field(OPENDDS_OPTIONAL_NS::optional<std::string>("Hello World"));
+  Optional::MutableOptionalMembers result;
+  amalgam_serializer_test(xcdr2, expected, value, result);
+}
+
 int main(int argc, char* argv[])
 {
   for (int i = 1; i < argc; ++i) {

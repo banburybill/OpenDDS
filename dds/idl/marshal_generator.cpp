@@ -2519,19 +2519,55 @@ namespace {
         std::ostringstream cases;
         for (Fields::Iterator i = fields.begin(); i != fields_end; ++i) {
           AST_Field* const field = *i;
+          const bool is_optional = be_global->is_optional(field);
           const OpenDDS::XTypes::MemberId id = be_global->get_id(field);
           string field_name =
-            string("stru") + value_access + "." + field->local_name()->get_string();
+            string("stru") + value_access + "." + field->local_name()->get_string() + (use_cxx11 ? "()" : "");
           cases <<
-            "      case " << id << ": {\n"
-            "        if (!" << generate_field_stream(
-                                                     indent, field, ">> stru" + value_access, field->local_name()->get_string(), wrap_nested_key_only, intro) << ") {\n";
+            "      case " << id << ": {\n";
+
+          if (is_optional) {
+            FieldInfo af(*field);
+            AST_Type* const field_type = resolveActualType(field->field_type());
+            Classification fld_cls = classify(field_type);
+            std::string type_name = (fld_cls & CL_STRING) ? ((fld_cls & CL_WIDE) ? "WString" : "String") : field->field_type()->full_name();
+            if (af.anonymous()) {
+              type_name = af.scoped_type_;
+            }
+            const std::string name_base = field->local_name()->get_string();
+            const std::string has_value_name = name_base + "_has_value";
+            cases <<
+              "        bool " << has_value_name << " = false;\n" <<
+
+              "        strm >> ACE_InputCDR::to_boolean(" << has_value_name << ");\n";
+            const std::string tmp_name = name_base + "_tmp";
+            cases <<
+              "        " << type_name << " " << tmp_name << ";\n" <<
+              "        if (" << has_value_name << ") {\n" <<
+              "          if (";
+            std::string strm_name = tmp_name;
+            if (fld_cls & CL_PRIMITIVE) {
+              AST_PredefinedType* p = dynamic_cast<AST_PredefinedType*>(field_type);
+              if (p->pt() == AST_PredefinedType::PT_boolean) {
+                strm_name = "ACE_InputCDR::to_boolean(" + tmp_name + ")";
+              }
+            } else if (fld_cls & (CL_ARRAY | CL_SEQUENCE)) {
+              RefWrapper wrapper(field_type, type_name, "", "", false);
+              wrapper.done();
+              strm_name = wrapper.wrapped_type_name() + "(" + strm_name + ")";
+            }
+            cases << "strm >> " << strm_name << ") {\n";
+            cases <<
+              "            " << field_name << " = " << tmp_name << ";\n" <<
+              "          } else {\n";
+          } else {
+            cases <<
+              "        if (!" <<
+              generate_field_stream(indent, field, ">> stru" + value_access, field->local_name()->get_string(), wrap_nested_key_only, intro) << ") {\n";
+          }
           AST_Type* const field_type = resolveActualType(field->field_type());
           const Classification fld_cls = classify(field_type);
 
-          if (use_cxx11) {
-            field_name += "()";
-          }
           const TryConstructFailAction try_construct = be_global->try_construct(field);
           if (try_construct == tryconstructfailaction_use_default) {
             cases <<
@@ -2579,6 +2615,9 @@ namespace {
             cases <<
               "          return false;\n";
           }
+          if (is_optional)
+            cases <<
+              "        }\n";
           cases <<
             "        }\n"
             "        break;\n"
@@ -2620,97 +2659,99 @@ namespace {
       }
 
       expr = "";
-      for (Fields::Iterator i = fields.begin(); i != fields_end; ++i) {
-        AST_Field* const field = *i;
-        const bool is_optional = be_global->is_optional(field);
+      if (!is_mutable) {
+        for (Fields::Iterator i = fields.begin(); i != fields_end; ++i) {
+          AST_Field* const field = *i;
+          const bool is_optional = be_global->is_optional(field);
 
-        if (expr.size() && exten != extensibilitykind_appendable) {
-          expr += "\n    && ";
-        }
-        if (is_appendable) {
-          expr +=
-            "  reached_end_of_struct |= (encoding.xcdr_version() == Encoding::XCDR_VERSION_2 && strm.rpos() >= end_of_struct);\n";
-        }
-        const string field_name = field->local_name()->get_string();
-        const string cond = rtpsCustom.getConditional(field_name);
-        if (!cond.empty()) {
-          string prefix = rtpsCustom.preFieldRead(field_name);
+          if (expr.size() && exten != extensibilitykind_appendable) {
+            expr += "\n    && ";
+          }
           if (is_appendable) {
-            if (!prefix.empty()) {
-              prefix = prefix.substr(0, prefix.length() - 8);
-              expr +=
-                "  if (!" + prefix + ") {\n"
-                "    return false;\n"
-                "  }\n";
+            expr +=
+              "  reached_end_of_struct |= (encoding.xcdr_version() == Encoding::XCDR_VERSION_2 && strm.rpos() >= end_of_struct);\n";
+          }
+          const string field_name = field->local_name()->get_string();
+          const string cond = rtpsCustom.getConditional(field_name);
+          if (!cond.empty()) {
+            string prefix = rtpsCustom.preFieldRead(field_name);
+            if (is_appendable) {
+              if (!prefix.empty()) {
+                prefix = prefix.substr(0, prefix.length() - 8);
+                expr +=
+                  "  if (!" + prefix + ") {\n"
+                  "    return false;\n"
+                  "  }\n";
+              }
+              expr += "  if ((" + cond + ") && !";
+            } else {
+              expr += prefix + "(!(" + cond + ") || ";
             }
-            expr += "  if ((" + cond + ") && !";
-          } else {
-            expr += prefix + "(!(" + cond + ") || ";
-          }
-        } else if (is_appendable) {
-          AST_Type* const type = field->field_type();
-          string stru_field_name = "stru" + value_access + "." + field_name;
-          if (use_cxx11) {
-            stru_field_name += "()";
-          }
-          expr +=
-            "  if (reached_end_of_struct) {\n" +
-            type_to_default("    ", type, stru_field_name, type->anonymous(), false, is_optional) +
-            "  } else {\n";
-          if (!is_optional) {
-            expr += "    if (!";
-          }
-        }
-
-        if (is_optional) {
-          FieldInfo af(*field);
-          AST_Type* const field_type = resolveActualType(field->field_type());
-          Classification fld_cls = classify(field_type);
-          std::string type_name = (fld_cls & CL_STRING) ? ((fld_cls & CL_WIDE) ? "WString" : "String") : field->field_type()->full_name();
-          if (af.anonymous()) {
-            type_name = af.scoped_type_;
-          }
-          const std::string has_value_name = field_name + "_has_value";
-          expr += "    bool " + field_name + "_has_value = false;\n";
-          expr += "    strm >> ACE_InputCDR::to_boolean(" + has_value_name + ");\n";
-          const std::string tmp_name = field_name + "_tmp";
-          expr += "    " + type_name + " " + tmp_name + ";\n";
-          expr += "    if (" + has_value_name + " && !";
-          std::string strm_name = tmp_name;
-          if (fld_cls & CL_PRIMITIVE) {
-            AST_PredefinedType* p = dynamic_cast<AST_PredefinedType*>(field_type);
-            if (p->pt() == AST_PredefinedType::PT_boolean) {
-              strm_name = "ACE_InputCDR::to_boolean(" + tmp_name + ")";
-            }
-          } else if (fld_cls & (CL_ARRAY | CL_SEQUENCE)) {
-            RefWrapper wrapper(field_type, type_name, "", "", false);
-            wrapper.done();
-            strm_name = wrapper.wrapped_type_name() + "(" + strm_name + ")";
-          }
-          expr += "(strm >> " + strm_name + ")";
-        } else {
-          expr += generate_field_stream(
-                                        indent, field, ">> stru" + value_access, field->local_name()->get_string(), wrap_nested_key_only, intro);
-        }
-        if (is_appendable) {
-          expr += ") {\n"
-            "      return false;\n"
-            "    }\n";
-
-          // Copy temporaries to the struct
-          if (is_optional) {
+          } else if (is_appendable) {
+            AST_Type* const type = field->field_type();
             string stru_field_name = "stru" + value_access + "." + field_name;
             if (use_cxx11) {
               stru_field_name += "()";
             }
-            expr += "    if (" + field_name + "_has_value) " + stru_field_name + " = " + field_name + "_tmp;\n";
-          }
-          if (cond.empty()) {
             expr +=
-              "  }\n";
+              "  if (reached_end_of_struct) {\n" +
+              type_to_default("    ", type, stru_field_name, type->anonymous(), false, is_optional) +
+              "  } else {\n";
+            if (!is_optional) {
+              expr += "    if (!";
+            }
           }
-        } else if (!cond.empty()) {
-          expr += ")";
+
+          if (is_optional) {
+            FieldInfo af(*field);
+            AST_Type* const field_type = resolveActualType(field->field_type());
+            Classification fld_cls = classify(field_type);
+            std::string type_name = (fld_cls & CL_STRING) ? ((fld_cls & CL_WIDE) ? "WString" : "String") : field->field_type()->full_name();
+            if (af.anonymous()) {
+              type_name = af.scoped_type_;
+            }
+            const std::string has_value_name = field_name + "_has_value";
+            expr += "    bool " + field_name + "_has_value = false;\n";
+            expr += "    strm >> ACE_InputCDR::to_boolean(" + has_value_name + ");\n";
+            const std::string tmp_name = field_name + "_tmp";
+            expr += "    " + type_name + " " + tmp_name + ";\n";
+            expr += "    if (" + has_value_name + " && !";
+            std::string strm_name = tmp_name;
+            if (fld_cls & CL_PRIMITIVE) {
+              AST_PredefinedType* p = dynamic_cast<AST_PredefinedType*>(field_type);
+              if (p->pt() == AST_PredefinedType::PT_boolean) {
+                strm_name = "ACE_InputCDR::to_boolean(" + tmp_name + ")";
+              }
+            } else if (fld_cls & (CL_ARRAY | CL_SEQUENCE)) {
+              RefWrapper wrapper(field_type, type_name, "", "", false);
+              wrapper.done();
+              strm_name = wrapper.wrapped_type_name() + "(" + strm_name + ")";
+            }
+            expr += "(strm >> " + strm_name + ")";
+          } else {
+            expr += generate_field_stream(
+              indent, field, ">> stru" + value_access, field->local_name()->get_string(), wrap_nested_key_only, intro);
+          }
+          if (is_appendable) {
+            expr += ") {\n"
+              "      return false;\n"
+              "    }\n";
+
+            // Copy temporaries to the struct
+            if (is_optional) {
+              string stru_field_name = "stru" + value_access + "." + field_name;
+              if (use_cxx11) {
+                stru_field_name += "()";
+              }
+              expr += "    if (" + field_name + "_has_value) " + stru_field_name + " = " + field_name + "_tmp;\n";
+            }
+            if (cond.empty()) {
+              expr +=
+                "  }\n";
+            }
+          } else if (!cond.empty()) {
+            expr += ")";
+          }
         }
       }
       intro.join(be_global->impl_, indent);
@@ -2835,6 +2876,8 @@ namespace {
           "    ACE_UNUSED_ARG(size);\n";
         for (Fields::Iterator i = fields.begin(); i != fields_end; ++i) {
           AST_Field* const field = *i;
+          const bool is_optional = be_global->is_optional(field);;
+          const string field_name = field->local_name()->get_string();
           const OpenDDS::XTypes::MemberId id = be_global->get_id(field);
           const bool must_understand = be_global->is_effectively_must_understand(field);
 
@@ -2848,7 +2891,7 @@ namespace {
             "    }\n"
             "    size = 0;\n"
             "    if (!" << generate_field_stream(
-              mutable_indent, field, "<< stru" + value_access, field->local_name()->get_string(), wrap_nested_key_only, intro)
+              mutable_indent, field, "<< stru" + value_access, field_name + (is_optional ? ".value" : ""), wrap_nested_key_only, intro)
             << ") {\n"
             "      return false;\n"
             "    }\n";
